@@ -1,0 +1,216 @@
+import { DEFAULT_SETTINGS, type ExtensionSettings } from '../shared/settings';
+import {
+  TRANSLATE_REQUEST,
+  type TranslateRequestMessage,
+  type TranslateRequestPayload,
+  type TranslateResponse,
+} from '../shared/messages';
+import { translatePage, type PageContext } from './translate-page';
+import { observeMutations } from './mutation-listener';
+import { TARGET_CLASS, TRANSLATED_ATTR } from '../shared/translated-mark';
+import { isBlockTranslated } from '../core/extractor/block-extractor';
+
+// 启动探针：看到这行说明 Content Script 已成功注入。
+// 看不到则问题在扩展加载/注入层，而非翻译逻辑。
+console.info(`[AI 实时翻译] Content Script 已注入（${window.location.hostname}）`);
+
+/**
+ * Content Script 入口。
+ * 只读取翻译所需的非敏感设置（开关 / 目标语言 / 排除站点），
+ * 从不读取、也拿不到 API 凭据。
+ */
+async function readContext(): Promise<PageContext> {
+  const stored = await chrome.storage.sync.get('settings');
+  const settings = (stored.settings ?? {}) as Partial<ExtensionSettings>;
+
+  return {
+    enabled: settings.enabled ?? DEFAULT_SETTINGS.enabled,
+    targetLang: settings.targetLang ?? DEFAULT_SETTINGS.targetLang,
+    excludedHosts: settings.excludedHosts ?? DEFAULT_SETTINGS.excludedHosts,
+  };
+}
+
+async function sendTranslateRequest(
+  payload: TranslateRequestPayload,
+): Promise<TranslateResponse> {
+  const message: TranslateRequestMessage = { type: TRANSLATE_REQUEST, payload };
+  return chrome.runtime.sendMessage<TranslateRequestMessage, TranslateResponse>(message);
+}
+
+/**
+ * 等待页面完全加载（SSR 框架的水合大多发生在 load 事件附近）。
+ * 必须带超时兜底：慢资源会让 load 拖很久甚至不触发，
+ * 那时翻译会一直不开始、页面上一点动静都没有。
+ */
+function waitForWindowLoad(timeoutMs = 5000): Promise<void> {
+  if (document.readyState === 'complete') {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    window.addEventListener(
+      'load',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+// 延迟开始翻译：给 React/Vue 等框架的水合留出时间。
+// 若在水合完成前插入译文，框架会因 DOM 与预期不符而报错并重建页面，
+// 我们插入的译文也会随之被清掉（表现为 React error #418）。
+const HYDRATION_GRACE_MS = 1500;
+
+/** 最近一次成功渲染的块数，供健康自检判断译文是否被整体清除 */
+let lastRenderedCount = 0;
+
+/**
+ * 带重入保护的整页翻译。
+ * 每次执行都动态取当前 document.body——SPA 框架可能替换整个 body。
+ */
+async function runTranslate(): Promise<void> {
+  const rendered = await translatePage({
+    root: document.body,
+    hostname: window.location.hostname,
+    getContext: readContext,
+    sendTranslateRequest,
+  });
+
+  if (rendered > 0) {
+    lastRenderedCount = rendered;
+  }
+}
+
+let running = false;
+let pending = false;
+let stopped = false;
+let healthCheckTimer: ReturnType<typeof setInterval> | undefined;
+let observer: MutationObserver | undefined;
+
+/**
+ * 扩展被重新加载/更新后，页面上这个「旧」content script 手里的 chrome API 会失效，
+ * 抛出 "Extension context invalidated"。这种状态无法恢复，只能停下——
+ * 否则自检循环会每 3 秒报一次同样的错。
+ */
+function isExtensionContextInvalidated(error: unknown): boolean {
+  return error instanceof Error && /extension context invalidated/i.test(error.message);
+}
+
+/** 停止本页的所有定时任务与监听 */
+function shutdown(): void {
+  stopped = true;
+
+  if (healthCheckTimer !== undefined) {
+    clearInterval(healthCheckTimer);
+    healthCheckTimer = undefined;
+  }
+
+  observer?.disconnect();
+  observer = undefined;
+
+  console.info('[AI 实时翻译] 扩展已更新，本页翻译停止。刷新页面即可恢复。');
+}
+
+/** 执行期间又有新变化时，跑完当前这轮再补一轮，避免并发重复渲染 */
+async function runTranslateGuarded(): Promise<void> {
+  if (stopped) {
+    return;
+  }
+
+  if (running) {
+    pending = true;
+    return;
+  }
+
+  running = true;
+  try {
+    await runTranslate();
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      shutdown();
+      return;
+    }
+    throw error;
+  } finally {
+    running = false;
+    if (pending && !stopped) {
+      pending = false;
+      void runTranslateGuarded();
+    }
+  }
+}
+
+function onMutations(): void {
+  console.info('[AI 实时翻译] 检测到页面变化，重新检查待译内容');
+  void runTranslateGuarded();
+}
+
+/**
+ * 健康自检兜底。
+ *
+ * React/Vue 重渲染会清掉我们插入的译文节点（框架只认自己虚拟 DOM 里的节点），
+ * 但容器上的 data-ai-translated 标记会留下——于是「有标记、没译文」。
+ * MutationObserver 未必能捕获这类重建，故按固定间隔主动巡检：
+ * 只要译文数量少于曾渲染过的数量，或存在「有标记但译文丢失」的块，就补翻
+ * （补翻走缓存，近乎零成本，且渲染是幂等的）。
+ */
+const HEALTH_CHECK_INTERVAL_MS = 3000;
+
+/** 统计「已标记但译文丢失」的块数量 */
+function countStaleTranslatedBlocks(): number {
+  let stale = 0;
+
+  for (const element of document.querySelectorAll(`[${TRANSLATED_ATTR}]`)) {
+    if (!isBlockTranslated(element)) {
+      stale += 1;
+    }
+  }
+
+  return stale;
+}
+
+function startHealthCheck(): void {
+  healthCheckTimer = setInterval(() => {
+    if (stopped || lastRenderedCount === 0) {
+      return;
+    }
+
+    const alive = document.querySelectorAll(`.${TARGET_CLASS}`).length;
+    const stale = countStaleTranslatedBlocks();
+
+    if (stale > 0 || alive < lastRenderedCount) {
+      console.info(
+        `[AI 实时翻译] 检测到译文缺失（现存 ${alive} / 已渲染 ${lastRenderedCount}），自动补翻`,
+      );
+      void runTranslateGuarded();
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+}
+
+void waitForWindowLoad()
+  .then(
+    () =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, HYDRATION_GRACE_MS);
+      }),
+  )
+  .then(() => {
+    // 监听必须在翻译开始「之前」挂上：SPA 框架可能在翻译进行中重建页面，
+    // 如果等到翻译完成才挂监听，那次重建中丢失的译文就永远没人补了。
+    // 挂在 document（浏览器层的根）而非 body/documentElement：
+    // 框架无论怎么重建 body 甚至 html，都不会让这个监听失效。
+    observer = observeMutations(document, onMutations);
+    startHealthCheck();
+    return runTranslateGuarded();
+  })
+  .catch((error: unknown) => {
+    if (isExtensionContextInvalidated(error)) {
+      shutdown();
+      return;
+    }
+    console.error('[AI 实时翻译] 整页翻译失败：', error);
+  });

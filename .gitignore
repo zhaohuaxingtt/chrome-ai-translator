@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE 数据目录，但保留项目记忆（跨会话上下文有价值）
+.codebuddy/*
+!.codebuddy/memory

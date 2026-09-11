@@ -1,0 +1,22 @@
+{
+  "name": "chrome-ai-translator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome 扩展：调用 AI 模型实时翻译网页内容（双语对照）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "^2.7.1",
+    "@types/chrome": "^0.0.300",
+    "happy-dom": "^20.14.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vitest": "^3.0.0"
+  }
+}
