@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { observeMutations } from '../src/content/mutation-listener';
+import { TARGET_CLASS } from '../src/shared/translated-mark';
 
 describe('DOM 变化监听', () => {
   beforeEach(() => {
@@ -46,5 +47,39 @@ describe('DOM 变化监听', () => {
     await vi.advanceTimersByTimeAsync(1000);
 
     expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('只涉及译文节点的增删不触发回调（否则会自我触发死循环）', async () => {
+    const callback = vi.fn();
+    const observer = observeMutations(document.body, callback);
+
+    const target = document.createElement('span');
+    target.className = TARGET_CLASS;
+    target.textContent = '译文';
+    document.body.appendChild(target);
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(callback).not.toHaveBeenCalled();
+
+    target.remove();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(callback).not.toHaveBeenCalled();
+    observer.disconnect();
+  });
+
+  it('译文节点与真实内容一起变化时仍会触发回调', async () => {
+    const callback = vi.fn();
+    const observer = observeMutations(document.body, callback);
+
+    const target = document.createElement('span');
+    target.className = TARGET_CLASS;
+    document.body.appendChild(target);
+    document.body.appendChild(document.createElement('p'));
+
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(callback).toHaveBeenCalledTimes(1);
+    observer.disconnect();
   });
 });

@@ -114,4 +114,34 @@ describe('译文渲染器', () => {
     expect(target?.style.fontSize).toBe('0.94em');
     expect(target?.style.opacity).toBe('0.85');
   });
+
+  it('渲染外层块时不会误删内层块的译文', () => {
+    document.body.innerHTML = '<div>Outer text<p>Inner text</p></div>';
+    const blocks = extractTextBlocks(document.body);
+    const outer = blocks.find((b) => b.element.tagName === 'DIV');
+    const inner = blocks.find((b) => b.element.tagName === 'P');
+    expect(outer).toBeDefined();
+    expect(inner).toBeDefined();
+
+    // 内层先渲染，外层后渲染——外层的清理不能波及内层
+    renderTranslation(inner as TextBlock, '内层译文');
+    renderTranslation(outer as TextBlock, '外层译文');
+
+    expect(document.body.querySelectorAll(`.${TARGET_CLASS}`)).toHaveLength(2);
+    expect(document.body.textContent).toContain('内层译文');
+    expect(document.body.textContent).toContain('外层译文');
+  });
+
+  it('外层块渲染后，内层块仍被判定为已翻译（补翻能收敛）', () => {
+    document.body.innerHTML = '<div>Outer text<p>Inner text</p></div>';
+    const blocks = extractTextBlocks(document.body);
+    const outer = blocks.find((b) => b.element.tagName === 'DIV') as TextBlock;
+    const inner = blocks.find((b) => b.element.tagName === 'P') as TextBlock;
+
+    renderTranslation(inner, '内层译文');
+    renderTranslation(outer, '外层译文');
+
+    // 应为空：否则每一轮巡检都会重翻这几个块，永远补不平
+    expect(extractTextBlocks(document.body)).toHaveLength(0);
+  });
 });

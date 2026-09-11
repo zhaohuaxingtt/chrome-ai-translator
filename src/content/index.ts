@@ -162,16 +162,21 @@ async function runTranslate(): Promise<void> {
   ball?.setBusy(true);
 
   try {
-    const rendered = await translatePage({
+    await translatePage({
       root: document.body,
       hostname: window.location.hostname,
       getContext: readContext,
       sendTranslateRequest,
     });
 
-    if (rendered > 0) {
-      lastRenderedCount = rendered;
+    // 基线取「页面实际存在的译文节点数」，而非本轮的渲染调用次数：
+    // 两者口径不同（同一个元素可能承载多个块），用调用次数会让自检永远判定缺译文。
+    const alive = document.querySelectorAll(`.${TARGET_CLASS}`).length;
+    if (alive > 0) {
+      lastRenderedCount = alive;
       pageTranslated = true;
+      // 重新进入勤查节奏：刚翻译完的这段时间最容易出问题
+      healthyChecks = 0;
     }
   } finally {
     ball?.setBusy(false);
@@ -182,7 +187,8 @@ async function runTranslate(): Promise<void> {
 let running = false;
 let pending = false;
 let stopped = false;
-let healthCheckTimer: ReturnType<typeof setInterval> | undefined;
+let healthCheckTimer: ReturnType<typeof setTimeout> | undefined;
+let healthyChecks = 0;
 let observer: MutationObserver | undefined;
 
 /**
@@ -199,7 +205,7 @@ function shutdown(): void {
   stopped = true;
 
   if (healthCheckTimer !== undefined) {
-    clearInterval(healthCheckTimer);
+    clearTimeout(healthCheckTimer);
     healthCheckTimer = undefined;
   }
 
@@ -248,11 +254,18 @@ function onMutations(): void {
  *
  * React/Vue 重渲染会清掉我们插入的译文节点（框架只认自己虚拟 DOM 里的节点），
  * 但容器上的 data-ai-translated 标记会留下——于是「有标记、没译文」。
- * MutationObserver 未必能捕获这类重建，故按固定间隔主动巡检：
- * 只要译文数量少于曾渲染过的数量，或存在「有标记但译文丢失」的块，就补翻
+ * MutationObserver 未必能捕获这类重建，故按间隔主动巡检：
+ * 只要存在「有标记但译文丢失」的块，或译文数量少于基线，就补翻
  * （补翻走缓存，近乎零成本，且渲染是幂等的）。
+ *
+ * 用递归 setTimeout 而非 setInterval：译文稳定后自动拉长间隔，
+ * 避免页面长期驻留时反复空转自检。
  */
 const HEALTH_CHECK_INTERVAL_MS = 3000;
+const HEALTH_CHECK_IDLE_INTERVAL_MS = 30_000;
+
+/** 连续这么多次巡检都无异常，就认为译文已稳定 */
+const HEALTHY_CHECKS_BEFORE_IDLE = 3;
 
 /** 统计「已标记但译文丢失」的块数量 */
 function countStaleTranslatedBlocks(): number {
@@ -267,9 +280,16 @@ function countStaleTranslatedBlocks(): number {
   return stale;
 }
 
-function startHealthCheck(): void {
-  healthCheckTimer = setInterval(() => {
-    if (stopped || lastRenderedCount === 0) {
+function scheduleHealthCheck(delayMs: number): void {
+  healthCheckTimer = setTimeout(() => {
+    healthCheckTimer = undefined;
+
+    if (stopped) {
+      return;
+    }
+
+    if (lastRenderedCount === 0) {
+      scheduleHealthCheck(HEALTH_CHECK_INTERVAL_MS);
       return;
     }
 
@@ -277,12 +297,22 @@ function startHealthCheck(): void {
     const stale = countStaleTranslatedBlocks();
 
     if (stale > 0 || alive < lastRenderedCount) {
+      healthyChecks = 0;
       console.info(
         `[AI 实时翻译] 检测到译文缺失（现存 ${alive} / 已渲染 ${lastRenderedCount}），自动补翻`,
       );
       void runTranslateGuarded();
+      scheduleHealthCheck(HEALTH_CHECK_INTERVAL_MS);
+      return;
     }
-  }, HEALTH_CHECK_INTERVAL_MS);
+
+    healthyChecks += 1;
+    scheduleHealthCheck(
+      healthyChecks >= HEALTHY_CHECKS_BEFORE_IDLE
+        ? HEALTH_CHECK_IDLE_INTERVAL_MS
+        : HEALTH_CHECK_INTERVAL_MS,
+    );
+  }, delayMs);
 }
 
 void waitForWindowLoad()
@@ -298,7 +328,7 @@ void waitForWindowLoad()
     // 挂在 document（浏览器层的根）而非 body/documentElement：
     // 框架无论怎么重建 body 甚至 html，都不会让这个监听失效。
     observer = observeMutations(document, onMutations);
-    startHealthCheck();
+    scheduleHealthCheck(HEALTH_CHECK_INTERVAL_MS);
 
     const settings = await readSettings();
 

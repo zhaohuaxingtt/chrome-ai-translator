@@ -40,8 +40,12 @@ export function renderTranslation(block: TextBlock, translated: string): void {
 
   const doc = anchor.ownerDocument;
 
-  // 幂等：先清掉本块已有的译文，避免重复渲染时叠加
-  for (const stale of block.element.querySelectorAll(`.${TARGET_CLASS}`)) {
+  // 幂等：只清掉「属于本块」的译文。
+  // 必须按 id 精确匹配：querySelectorAll 是子树查询，渲染外层块时会把后代块的译文
+  // 一并删掉；后代块随即被判成「有标记、没译文」而反复重翻，永远补不平。
+  for (const stale of block.element.querySelectorAll(
+    `.${TARGET_CLASS}[${TARGET_FOR_ATTR}="${block.id}"]`,
+  )) {
     stale.remove();
   }
 
