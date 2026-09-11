@@ -9,6 +9,7 @@ import { translatePage, type PageContext } from './translate-page';
 import { observeMutations } from './mutation-listener';
 import { TARGET_CLASS, TRANSLATED_ATTR } from '../shared/translated-mark';
 import { isBlockTranslated } from '../core/extractor/block-extractor';
+import { createFloatingBall, type FloatingBallHandle } from './floating-ball';
 
 // 启动探针：看到这行说明 Content Script 已成功注入。
 // 看不到则问题在扩展加载/注入层，而非翻译逻辑。
@@ -19,14 +20,37 @@ console.info(`[AI 实时翻译] Content Script 已注入（${window.location.hos
  * 只读取翻译所需的非敏感设置（开关 / 目标语言 / 排除站点），
  * 从不读取、也拿不到 API 凭据。
  */
-async function readContext(): Promise<PageContext> {
+/**
+ * 页面侧只读取这些非敏感字段。
+ * API 凭据（baseUrl / apiKey / model）刻意不在其中——它们只归 Background 所有，
+ * 把安全边界写进类型，避免哪天被顺手加进来。
+ */
+interface PageSettings {
+  enabled: boolean;
+  autoTranslate: boolean;
+  targetLang: string;
+  excludedHosts: string[];
+}
+
+async function readSettings(): Promise<PageSettings> {
   const stored = await chrome.storage.sync.get('settings');
-  const settings = (stored.settings ?? {}) as Partial<ExtensionSettings>;
+  const raw = (stored.settings ?? {}) as Partial<ExtensionSettings>;
 
   return {
-    enabled: settings.enabled ?? DEFAULT_SETTINGS.enabled,
-    targetLang: settings.targetLang ?? DEFAULT_SETTINGS.targetLang,
-    excludedHosts: settings.excludedHosts ?? DEFAULT_SETTINGS.excludedHosts,
+    enabled: raw.enabled ?? DEFAULT_SETTINGS.enabled,
+    autoTranslate: raw.autoTranslate ?? DEFAULT_SETTINGS.autoTranslate,
+    targetLang: raw.targetLang ?? DEFAULT_SETTINGS.targetLang,
+    excludedHosts: raw.excludedHosts ?? DEFAULT_SETTINGS.excludedHosts,
+  };
+}
+
+async function readContext(): Promise<PageContext> {
+  const settings = await readSettings();
+
+  return {
+    enabled: settings.enabled,
+    targetLang: settings.targetLang,
+    excludedHosts: settings.excludedHosts,
   };
 }
 
@@ -69,19 +93,86 @@ const HYDRATION_GRACE_MS = 1500;
 let lastRenderedCount = 0;
 
 /**
+ * 本页是否已开启翻译（运行时状态，刷新后重置）。
+ * 默认跟随设置的 autoTranslate；为 false 时页面保持原文，
+ * 由悬浮球手动开启后才翻译。
+ */
+let pageTranslationEnabled = false;
+
+/** 本页当前是否已渲染出译文 */
+let pageTranslated = false;
+
+/** 悬浮球句柄（插件关闭时不创建） */
+let ball: FloatingBallHandle | undefined;
+
+function togglePageTranslation(): void {
+  if (pageTranslated) {
+    disablePageTranslation();
+    return;
+  }
+  enablePageTranslation();
+}
+
+/** 供悬浮球调用：开启本页翻译 */
+export function enablePageTranslation(): void {
+  pageTranslationEnabled = true;
+  void runTranslateGuarded();
+}
+
+/** 供悬浮球调用：关闭本页翻译并移除已渲染的译文 */
+export function disablePageTranslation(): void {
+  pageTranslationEnabled = false;
+  pageTranslated = false;
+
+  // 移除本页所有译文，页面恢复原文（原文节点从未被改写，所以删掉译文即可）
+  for (const element of document.querySelectorAll(`[${TRANSLATED_ATTR}]`)) {
+    element.removeAttribute(TRANSLATED_ATTR);
+  }
+  for (const target of document.querySelectorAll(`.${TARGET_CLASS}`)) {
+    target.remove();
+  }
+
+  lastRenderedCount = 0;
+  ball?.setTranslated(false);
+}
+
+/** 创建悬浮球——按需模式下的主要入口 */
+function setupFloatingBall(): void {
+  ball = createFloatingBall({
+    root: document.body,
+    onToggleTranslate: togglePageTranslation,
+    onOpenSettings: () => {
+      void chrome.runtime.openOptionsPage();
+    },
+    onHide: () => {
+      ball?.destroy();
+      ball = undefined;
+    },
+  });
+}
+
+/**
  * 带重入保护的整页翻译。
  * 每次执行都动态取当前 document.body——SPA 框架可能替换整个 body。
  */
 async function runTranslate(): Promise<void> {
-  const rendered = await translatePage({
-    root: document.body,
-    hostname: window.location.hostname,
-    getContext: readContext,
-    sendTranslateRequest,
-  });
+  ball?.setBusy(true);
 
-  if (rendered > 0) {
-    lastRenderedCount = rendered;
+  try {
+    const rendered = await translatePage({
+      root: document.body,
+      hostname: window.location.hostname,
+      getContext: readContext,
+      sendTranslateRequest,
+    });
+
+    if (rendered > 0) {
+      lastRenderedCount = rendered;
+      pageTranslated = true;
+    }
+  } finally {
+    ball?.setBusy(false);
+    ball?.setTranslated(pageTranslated);
   }
 }
 
@@ -117,7 +208,7 @@ function shutdown(): void {
 
 /** 执行期间又有新变化时，跑完当前这轮再补一轮，避免并发重复渲染 */
 async function runTranslateGuarded(): Promise<void> {
-  if (stopped) {
+  if (stopped || !pageTranslationEnabled) {
     return;
   }
 
@@ -198,14 +289,30 @@ void waitForWindowLoad()
         setTimeout(resolve, HYDRATION_GRACE_MS);
       }),
   )
-  .then(() => {
+  .then(async () => {
     // 监听必须在翻译开始「之前」挂上：SPA 框架可能在翻译进行中重建页面，
     // 如果等到翻译完成才挂监听，那次重建中丢失的译文就永远没人补了。
     // 挂在 document（浏览器层的根）而非 body/documentElement：
     // 框架无论怎么重建 body 甚至 html，都不会让这个监听失效。
     observer = observeMutations(document, onMutations);
     startHealthCheck();
-    return runTranslateGuarded();
+
+    const settings = await readSettings();
+
+    // 插件关闭：连悬浮球都不显示
+    if (!settings.enabled) {
+      return undefined;
+    }
+
+    setupFloatingBall();
+
+    pageTranslationEnabled = settings.autoTranslate;
+
+    // 按需模式（默认）：页面保持原文，等用户点悬浮球触发
+    if (pageTranslationEnabled) {
+      return runTranslateGuarded();
+    }
+    return undefined;
   })
   .catch((error: unknown) => {
     if (isExtensionContextInvalidated(error)) {
