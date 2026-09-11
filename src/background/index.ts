@@ -3,7 +3,11 @@ import { ChromeSettingsStore } from '../adapters/chrome-settings-store';
 import { TranslationCache } from '../core/cache/translation-cache';
 import { TranslationScheduler } from '../core/scheduler/translation-scheduler';
 import { AiTranslationClient } from '../core/translator/ai-client';
-import { isTranslateRequestMessage, type TranslateResponse } from '../shared/messages';
+import {
+  isOpenOptionsMessage,
+  isTranslateRequestMessage,
+  type TranslateResponse,
+} from '../shared/messages';
 import { handleTranslateRequest } from './translate-handler';
 
 /**
@@ -43,6 +47,13 @@ function failureResponse(
 }
 
 chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+  // Content Script 打开不了设置页（其可用 API 子集里没有 openOptionsPage），由这里代劳
+  if (isOpenOptionsMessage(message)) {
+    void chrome.runtime.openOptionsPage();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (!isTranslateRequestMessage(message)) {
     return false;
   }

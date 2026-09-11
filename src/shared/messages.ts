@@ -7,6 +7,25 @@
 
 export const TRANSLATE_REQUEST = 'TRANSLATE_REQUEST' as const;
 
+/**
+ * 请求打开设置页。
+ * Content Script 拿不到 chrome.runtime.openOptionsPage（不在其可用的 API 子集里，
+ * 尽管类型声明存在——编译期不报错、运行时才炸），只能请 Background 代劳。
+ */
+export const OPEN_OPTIONS_REQUEST = 'OPEN_OPTIONS_REQUEST' as const;
+
+export interface OpenOptionsMessage {
+  type: typeof OPEN_OPTIONS_REQUEST;
+}
+
+export function isOpenOptionsMessage(value: unknown): value is OpenOptionsMessage {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as { type?: unknown };
+  return candidate.type === OPEN_OPTIONS_REQUEST;
+}
+
 export interface TranslateRequestBlock {
   id: string;
   text: string;

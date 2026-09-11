@@ -1,5 +1,6 @@
 import { DEFAULT_SETTINGS, type ExtensionSettings } from '../shared/settings';
 import {
+  OPEN_OPTIONS_REQUEST,
   TRANSLATE_REQUEST,
   type TranslateRequestMessage,
   type TranslateRequestPayload,
@@ -142,7 +143,9 @@ function setupFloatingBall(): void {
     root: document.body,
     onToggleTranslate: togglePageTranslation,
     onOpenSettings: () => {
-      void chrome.runtime.openOptionsPage();
+      // Content Script 无法直接调用 openOptionsPage（其可用 API 子集里没有），
+      // 请 Background 代劳
+      void chrome.runtime.sendMessage({ type: OPEN_OPTIONS_REQUEST });
     },
     onHide: () => {
       ball?.destroy();
