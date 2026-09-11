@@ -82,4 +82,36 @@ describe('译文渲染器', () => {
     expect(document.body.querySelector('b')?.textContent).toBe('brave');
     expect(extractTextBlocks(document.body).map((b) => b.text)).toEqual(['Hello brave world']);
   });
+
+  it('按钮里的译文跟在同一行并加括号，不撑高按钮', () => {
+    document.body.innerHTML = '<button>Create new API key</button>';
+    const block = firstBlock();
+
+    renderTranslation(block, '创建新的 API 密钥');
+
+    const target = document.body.querySelector<HTMLElement>(`.${TARGET_CLASS}`);
+    expect(target?.style.display).toBe('inline');
+    expect(target?.textContent).toBe('(创建新的 API 密钥)');
+  });
+
+  it('带按钮样式的链接（class 含 btn）同样按紧凑处理', () => {
+    document.body.innerHTML = '<a class="btn-primary" href="#">Save changes</a>';
+    const block = firstBlock();
+
+    renderTranslation(block, '保存更改');
+
+    const target = document.body.querySelector<HTMLElement>(`.${TARGET_CLASS}`);
+    expect(target?.style.display).toBe('inline');
+  });
+
+  it('译文带弱化样式，与原文形成层次', () => {
+    document.body.innerHTML = '<p>Hello world</p>';
+    const block = firstBlock();
+
+    renderTranslation(block, '你好，世界');
+
+    const target = document.body.querySelector<HTMLElement>(`.${TARGET_CLASS}`);
+    expect(target?.style.fontSize).toBe('0.94em');
+    expect(target?.style.opacity).toBe('0.85');
+  });
 });

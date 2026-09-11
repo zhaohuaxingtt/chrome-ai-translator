@@ -5,6 +5,7 @@
  */
 
 import { TRANSLATED_ATTR, TARGET_CLASS, TARGET_FOR_ATTR } from '../../shared/translated-mark';
+import { isCompactElement } from '../../shared/compact-element';
 
 export interface TextBlock {
   id: string;
@@ -25,6 +26,8 @@ const BLOCK_TAGS = new Set([
   'ARTICLE',
   'ASIDE',
   'BLOCKQUOTE',
+  // 按钮文本独立成块：否则会归到外层容器，翻译时把按钮一起撑变形
+  'BUTTON',
   'DD',
   'DIV',
   'DT',
@@ -131,7 +134,9 @@ function findContainer(node: Node, root: ParentNode): Element | null {
 
   while (element !== null) {
     last = element;
-    if (BLOCK_TAGS.has(element.tagName) || element === root) {
+    // 紧凑控件也单独成块：否则按钮里的文字会归到外层容器，
+    // 译文换行时会把按钮/导航项撑变形。
+    if (BLOCK_TAGS.has(element.tagName) || isCompactElement(element) || element === root) {
       return element;
     }
     element = element.parentElement;
